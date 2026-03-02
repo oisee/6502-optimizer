@@ -1,0 +1,106 @@
+package search
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+
+	"github.com/oisee/6502-optimizer/pkg/inst"
+	"github.com/oisee/6502-optimizer/pkg/result"
+)
+
+// Config holds search configuration.
+type Config struct {
+	MaxTargetLen int      // Maximum target sequence length (2-5)
+	MaxCandLen   int      // Maximum candidate length (defaults to MaxTargetLen-1)
+	NumWorkers   int      // Number of parallel workers (defaults to NumCPU)
+	Verbose      bool     // Print progress
+	DeadFlags    FlagMask // If nonzero, also search for flag-relaxed optimizations
+}
+
+// Run executes the superoptimizer search.
+func Run(cfg Config) *result.Table {
+	if cfg.NumWorkers <= 0 {
+		cfg.NumWorkers = runtime.NumCPU()
+	}
+	if cfg.MaxCandLen <= 0 {
+		cfg.MaxCandLen = cfg.MaxTargetLen - 1
+	}
+
+	pool := NewWorkerPool(cfg.NumWorkers)
+	startTime := time.Now()
+
+	for targetLen := 2; targetLen <= cfg.MaxTargetLen; targetLen++ {
+		if cfg.Verbose {
+			fmt.Printf("=== Searching target length %d ===\n", targetLen)
+		}
+
+		tasks := collectTasks(targetLen, cfg.MaxCandLen, cfg.DeadFlags)
+		if cfg.Verbose {
+			fmt.Printf("  Generated %d target sequences (after pruning)\n", len(tasks))
+		}
+
+		pool.RunTasks(tasks, cfg.Verbose)
+
+		checked, found := pool.Stats()
+		if cfg.Verbose {
+			elapsed := time.Since(startTime)
+			fmt.Printf("  Checked: %d, Found: %d, Elapsed: %s\n", checked, found, elapsed.Round(time.Millisecond))
+		}
+	}
+
+	return pool.Results
+}
+
+// collectTasks generates all non-prunable target sequences of the given length.
+func collectTasks(targetLen, maxCandLen int, deadFlags FlagMask) []SearchTask {
+	var tasks []SearchTask
+
+	EnumerateSequences(targetLen, func(seq []inst.Instruction) bool {
+		if ShouldPrune(seq) {
+			return true
+		}
+
+		seqCopy := make([]inst.Instruction, len(seq))
+		copy(seqCopy, seq)
+		tasks = append(tasks, SearchTask{
+			Target:     seqCopy,
+			MaxCandLen: maxCandLen,
+			DeadFlags:  deadFlags,
+		})
+		return true
+	})
+
+	return tasks
+}
+
+// SearchSingle finds the shortest replacement for a specific target sequence.
+func SearchSingle(target []inst.Instruction, maxCandLen int, verbose bool) *result.Rule {
+	pool := NewWorkerPool(1)
+	pool.RunTasks([]SearchTask{{
+		Target:     target,
+		MaxCandLen: maxCandLen,
+	}}, verbose)
+
+	rules := pool.Results.Rules()
+	if len(rules) == 0 {
+		return nil
+	}
+	return &rules[0]
+}
+
+// SearchSingleMasked finds the shortest replacement with dead-flags relaxation.
+func SearchSingleMasked(target []inst.Instruction, maxCandLen int, deadFlags FlagMask, verbose bool) *result.Rule {
+	pool := NewWorkerPool(1)
+	pool.RunTasks([]SearchTask{{
+		Target:     target,
+		MaxCandLen: maxCandLen,
+		DeadFlags:  deadFlags,
+	}}, verbose)
+
+	rules := pool.Results.Rules()
+	if len(rules) == 0 {
+		return nil
+	}
+	return &rules[0]
+}
