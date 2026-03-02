@@ -86,6 +86,75 @@ Use `--dead-flags` to find optimizations where certain flags don't need to be pr
 ./6502opt target "CLC : ADC #$01" --dead-flags all
 ```
 
+## CUDA GPU Search
+
+A standalone CUDA implementation of the full 3-stage pipeline runs on NVIDIA GPUs for massive speedup over CPU enumeration.
+
+### Build & Run
+
+```bash
+cd cuda
+nvcc -O2 -o 6502search_v2 6502_search_v2.cu
+
+# Full length-2 search
+./6502search_v2 --max-target 2 > results.jsonl
+
+# With dead flags (all flags dead = register-only equivalence)
+./6502search_v2 --max-target 2 --dead-flags 0xFF > results_dead.jsonl
+
+# Dual-GPU: split instruction range across two GPUs
+./6502search_v2 --gpu-id 0 --first-op-end 1500 > results_gpu0.jsonl
+./6502search_v2 --gpu-id 1 --first-op-start 1500 > results_gpu1.jsonl
+
+# Verify GPU results against Go CPU ExhaustiveCheck
+cd .. && ./6502opt verify-jsonl results.jsonl
+```
+
+### Pipeline Architecture
+
+The GPU search uses a 3-stage batched pipeline matching the CPU verification hierarchy:
+
+1. **Stage 1 — Batched QuickCheck**: 512 targets × 2,863 candidates per kernel launch. Each thread computes one (target, candidate) pair against 8 test vectors, producing a 64-byte fingerprint. Matches are recorded in a bitmap via `atomicOr`.
+
+2. **Stage 2 — GPU MidCheck**: QuickCheck survivors are tested against 24 additional vectors on the GPU. Filters ~74% of false positives from Stage 1.
+
+3. **Stage 3 — GPU ExhaustiveCheck**: MidCheck survivors get full exhaustive verification. 256 threads per block sweep all A(256) × C(2) base combinations, with additional register sweeps (X, Y, M, S, S0, S1) as needed. Shared-memory early termination aborts blocks on first mismatch.
+
+For targets with 3+ extra registers (memory/stack ops), a reduced sweep of 32 representative values per register keeps GPU verification tractable, with CPU fallback for any borderline cases.
+
+### Performance
+
+On a single RTX 4060 Ti 16GB:
+
+| Metric | Value |
+|--------|-------|
+| Total time (length 2) | **1,041 seconds** (~17 min) |
+| Targets tested | 7,633,612 |
+| QuickCheck hits | 20,654,396 |
+| MidCheck survivors | 5,373,297 |
+| ExhaustiveCheck | 5,373,297 (GPU: 5,368,395 / CPU: 4,902) |
+| Results found | **1,078,897** |
+| QC false positive rate | 94.8% (QC→confirmed) |
+
+### Results Summary
+
+1,078,897 concrete rules collapse into **403 pattern families**. Key optimization categories:
+
+| Category | Examples | Patterns |
+|----------|----------|----------|
+| Dead compare before compare/shift | `CMP #n : CPX #n → CPX #n` | 594K rules |
+| ALU constant folding | `AND #n : AND #m → AND #(n&m)` | 171K rules |
+| LDA+ALU simplification | `LDA #n : EOR #m → LDA #(n^m)` | 131K rules |
+| Memory redundancy | `LDA M : STA M → LDA M` | 6K rules |
+| Shift+mask fusion | `ROL A : AND #$FE → ASL A` | ~100 rules |
+| Stack/BIT dead code | `BIT M : ADC #n → ADC #n` | ~100 rules |
+
+Notable non-obvious optimizations found:
+- `ROL A : AND #$FE → ASL A` — rotate+mask to simple shift (-2B, -2cy)
+- `ROR A : AND #$7F → LSR A` — same pattern, opposite direction
+- `LDA M : EOR M → LDA #$00` — self-XOR to zero constant (-2B, -4cy)
+- `BIT M : ADC #$00 → ADC #$00` — dead BIT before arithmetic
+
 ## Architecture
 
 ```
@@ -95,6 +164,7 @@ pkg/search/      QuickCheck + MidCheck + ExhaustiveCheck, enumerator, pruner, wo
 pkg/stoke/       STOKE MCMC optimizer (cost function, mutator, parallel chains)
 pkg/result/      Rule storage, JSON/Go output, gob checkpoints
 cmd/6502opt/     CLI
+cuda/            CUDA GPU search (6502_common.h + 6502_search_v2.cu)
 ```
 
 ## Pruning
